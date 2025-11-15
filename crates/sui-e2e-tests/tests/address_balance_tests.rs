@@ -25,7 +25,7 @@ use sui_types::{
     supported_protocol_versions::SupportedProtocolVersions,
     transaction::{
         Argument, Command, FundsWithdrawalArg, GasData, Transaction, TransactionData,
-        TransactionDataV1, TransactionExpiration, TransactionKind,
+        TransactionDataAPI, TransactionDataV1, TransactionExpiration, TransactionKind,
     },
 };
 use test_cluster::TestClusterBuilder;
@@ -205,7 +205,9 @@ async fn test_accumulators_disabled() {
         .unwrap_err();
 
     // Transfer fails at execution time
-    let tx = make_send_to_account_tx(1000, recipient, sender, gas, rgp);
+    let tx = TestTransactionBuilder::new(sender, gas, rgp)
+        .transfer_sui_to_address_balance(1000, recipient)
+        .build();
 
     let signed = test_cluster.wallet.sign_transaction(&tx).await;
     let effects = test_cluster
@@ -234,7 +236,9 @@ async fn test_accumulators_disabled() {
         .unwrap_err();
 
     // transfer fails at execution time
-    let tx = make_send_to_account_tx(1000, recipient, sender, gas, rgp);
+    let tx = TestTransactionBuilder::new(sender, gas, rgp)
+        .transfer_sui_to_address_balance(1000, recipient)
+        .build();
 
     let signed = test_cluster.wallet.sign_transaction(&tx).await;
     let effects = test_cluster
@@ -251,7 +255,9 @@ async fn test_accumulators_disabled() {
     // after one more reconfig, we can upgrade to the next protocol version.
     test_cluster.trigger_reconfiguration().await;
 
-    let tx = make_send_to_account_tx(1000, sender, sender, gas, rgp);
+    let tx = TestTransactionBuilder::new(sender, gas, rgp)
+        .transfer_sui_to_address_balance(1000, sender)
+        .build();
 
     let gas = test_cluster
         .sign_and_execute_transaction(&tx)
@@ -305,14 +311,18 @@ async fn test_deposits() {
 
     let recipient = SuiAddress::random_for_testing_only();
 
-    let tx = make_send_to_account_tx(1000, recipient, sender, gas, rgp);
+    let tx = TestTransactionBuilder::new(sender, gas, rgp)
+        .transfer_sui_to_address_balance(1000, recipient)
+        .build();
 
     let res = test_cluster.sign_and_execute_transaction(&tx).await;
     let gas = res.effects.unwrap().gas_object().reference.to_object_ref();
 
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    let tx = make_send_to_account_tx(1000, recipient, sender, gas, rgp);
+    let tx = TestTransactionBuilder::new(sender, gas, rgp)
+        .transfer_sui_to_address_balance(1000, recipient)
+        .build();
 
     test_cluster.sign_and_execute_transaction(&tx).await;
 
@@ -352,26 +362,28 @@ async fn test_multiple_settlement_txns() {
         cfg
     });
 
-    let mut test_cluster = TestClusterBuilder::new().build().await;
-    let rgp = test_cluster.get_reference_gas_price().await;
-    let context = &mut test_cluster.wallet;
-
-    let (sender, gas) = get_sender_and_one_gas(context).await;
-
+    let test_cluster = TestClusterBuilder::new().build().await;
     let recipient = SuiAddress::random_for_testing_only();
 
     let amounts_and_recipients = (0..20)
-        .map(|_| (1u64, SuiAddress::random_for_testing_only()))
+        .map(|_| (1u64, Some(SuiAddress::random_for_testing_only())))
         .collect::<Vec<_>>();
 
-    let tx = make_send_to_multi_account_tx(&amounts_and_recipients, sender, gas, rgp);
+    let tx = test_cluster
+        .test_transaction_builder()
+        .await
+        .send_funds_sui(&amounts_and_recipients)
+        .build();
 
-    let res = test_cluster.sign_and_execute_transaction(&tx).await;
-    let gas = res.effects.unwrap().gas_object().reference.to_object_ref();
+    test_cluster.sign_and_execute_transaction(&tx).await;
 
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    let tx = make_send_to_account_tx(1000, recipient, sender, gas, rgp);
+    let tx = test_cluster
+        .test_transaction_builder()
+        .await
+        .send_funds_sui(&[(1000, Some(recipient))])
+        .build();
 
     test_cluster.sign_and_execute_transaction(&tx).await;
 
@@ -380,7 +392,7 @@ async fn test_multiple_settlement_txns() {
         let child_object_resolver = state.get_child_object_resolver().as_ref();
 
         for (amount, recipient) in amounts_and_recipients {
-            verify_accumulator_exists(child_object_resolver, recipient, amount);
+            verify_accumulator_exists(child_object_resolver, recipient.unwrap(), amount);
         }
     });
 
@@ -467,14 +479,14 @@ async fn test_deposit_and_withdraw() {
         cfg
     });
 
-    let mut test_cluster = TestClusterBuilder::new().build().await;
-    let rgp = test_cluster.get_reference_gas_price().await;
-    let context = &mut test_cluster.wallet;
-
-    let (sender, gas) = get_sender_and_one_gas(context).await;
-
-    let tx = make_send_to_account_tx(1000, sender, sender, gas, rgp);
-    let res = test_cluster.sign_and_execute_transaction(&tx).await;
+    let test_cluster = TestClusterBuilder::new().build().await;
+    let tx = test_cluster
+        .test_transaction_builder()
+        .await
+        .send_funds_sui(&[(1000, None)])
+        .build();
+    let sender = tx.sender();
+    test_cluster.sign_and_execute_transaction(&tx).await;
 
     test_cluster.fullnode_handle.sui_node.with(|node| {
         let state = node.state();
@@ -482,9 +494,11 @@ async fn test_deposit_and_withdraw() {
         verify_accumulator_exists(child_object_resolver, sender, 1000);
     });
 
-    let gas = res.effects.unwrap().gas_object().reference.to_object_ref();
-
-    let tx = withdraw_from_balance_tx(1000, sender, gas, rgp);
+    let tx = test_cluster
+        .test_transaction_builder()
+        .await
+        .withdraw_funds_sui(1000, 1000, None)
+        .build();
     test_cluster.sign_and_execute_transaction(&tx).await;
 
     test_cluster.fullnode_handle.sui_node.with(|node| {
@@ -514,18 +528,22 @@ async fn test_deposit_and_withdraw_with_larger_reservation() {
         cfg
     });
 
-    let mut test_cluster = TestClusterBuilder::new().build().await;
-    let rgp = test_cluster.get_reference_gas_price().await;
-    let context = &mut test_cluster.wallet;
+    let test_cluster = TestClusterBuilder::new().build().await;
 
-    let (sender, gas) = get_sender_and_one_gas(context).await;
-
-    let tx = make_send_to_account_tx(1000, sender, sender, gas, rgp);
-    let res = test_cluster.sign_and_execute_transaction(&tx).await;
-    let gas = res.effects.unwrap().gas_object().reference.to_object_ref();
+    let tx = test_cluster
+        .test_transaction_builder()
+        .await
+        .send_funds_sui(&[(1000, None)])
+        .build();
+    let sender = tx.sender();
+    test_cluster.sign_and_execute_transaction(&tx).await;
 
     // Withdraw 800 with a reservation of 1000 (larger than actual withdrawal)
-    let tx = withdraw_from_balance_tx_with_reservation(800, 1000, sender, gas, rgp);
+    let tx = test_cluster
+        .test_transaction_builder()
+        .await
+        .withdraw_funds_sui(800, 1000, None)
+        .build();
     test_cluster.sign_and_execute_transaction(&tx).await;
 
     test_cluster.fullnode_handle.sui_node.with(|node| {
@@ -580,22 +598,22 @@ async fn test_withdraw_insufficient_balance() {
         .with_num_validators(1)
         .build()
         .await;
-    let rgp = test_cluster.get_reference_gas_price().await;
-    let context = &mut test_cluster.wallet;
-
-    let (sender, mut gas) = get_sender_and_all_gas(context).await;
-
-    let gas1 = gas.pop().unwrap();
-    let gas2 = gas.pop().unwrap();
 
     // send 1000 from our gas coin to our balance
-    let tx = make_send_to_account_tx(1000, sender, sender, gas1, rgp);
-    let res = test_cluster.sign_and_execute_transaction(&tx).await;
-    let gas1 = res.effects.unwrap().gas_object().reference.to_object_ref();
+    let tx = test_cluster
+        .test_transaction_builder()
+        .await
+        .send_funds_sui(&[(1000, None)])
+        .build();
+    test_cluster.sign_and_execute_transaction(&tx).await;
 
     // Try to withdraw 1001 from balance
     // Transaction fails at signing time
-    let tx = withdraw_from_balance_tx(1001, sender, gas1, rgp);
+    let tx = test_cluster
+        .test_transaction_builder()
+        .await
+        .withdraw_funds_sui(1001, 1001, None)
+        .build();
     let signed_tx = test_cluster.sign_transaction(&tx).await;
     let err = test_cluster
         .wallet
@@ -605,10 +623,23 @@ async fn test_withdraw_insufficient_balance() {
 
     assert!(err.to_string().contains("is less than requested"));
 
+    let context = &mut test_cluster.wallet;
+    let (sender, mut gas) = get_sender_and_all_gas(context).await;
+    let gas1 = gas.pop().unwrap();
+    let gas2 = gas.pop().unwrap();
+
     // Now exceed the balance with two transactions, each of which can be certified
     // The second one will fail at execution time
-    let tx1 = withdraw_from_balance_tx(500, sender, gas1, rgp);
-    let tx2 = withdraw_from_balance_tx(501, sender, gas2, rgp);
+    let tx1 = test_cluster
+        .test_transaction_builder_with_gas_object(sender, gas1)
+        .await
+        .withdraw_funds_sui(500, 500, None)
+        .build();
+    let tx2 = test_cluster
+        .test_transaction_builder_with_gas_object(sender, gas2)
+        .await
+        .withdraw_funds_sui(501, 501, None)
+        .build();
 
     let mut effects = test_cluster
         .sign_and_execute_txns_in_soft_bundle(&[tx1, tx2])
@@ -677,48 +708,6 @@ fn withdraw_from_balance_tx_with_reservation(
     TransactionData::new(tx, sender, gas, 10000000, rgp)
 }
 
-fn make_send_to_account_tx(
-    amount: u64,
-    recipient: SuiAddress,
-    sender: SuiAddress,
-    gas: ObjectRef,
-    rgp: u64,
-) -> TransactionData {
-    make_send_to_multi_account_tx(&[(amount, recipient)], sender, gas, rgp)
-}
-
-fn make_send_to_multi_account_tx(
-    amounts_and_recipients: &[(u64, SuiAddress)],
-    sender: SuiAddress,
-    gas: ObjectRef,
-    rgp: u64,
-) -> TransactionData {
-    let mut builder = ProgrammableTransactionBuilder::new();
-
-    for (amount, recipient) in amounts_and_recipients {
-        let amount_arg = builder.pure(*amount).unwrap();
-        let recipient_arg = builder.pure(recipient).unwrap();
-        let coin = builder.command(Command::SplitCoins(Argument::GasCoin, vec![amount_arg]));
-
-        let Argument::Result(coin_idx) = coin else {
-            panic!("coin is not a result");
-        };
-
-        let coin = Argument::NestedResult(coin_idx, 0);
-
-        builder.programmable_move_call(
-            SUI_FRAMEWORK_PACKAGE_ID,
-            Identifier::new("coin").unwrap(),
-            Identifier::new("send_funds").unwrap(),
-            vec!["0x2::sui::SUI".parse().unwrap()],
-            vec![coin, recipient_arg],
-        );
-    }
-
-    let tx = TransactionKind::ProgrammableTransaction(builder.finish());
-    TransactionData::new(tx, sender, gas, 10000000, rgp)
-}
-
 #[sim_test]
 async fn test_address_balance_gas() {
     let _guard = ProtocolConfig::apply_overrides_for_testing(|_, mut cfg| {
@@ -733,7 +722,9 @@ async fn test_address_balance_gas() {
     let gas_package_id = setup_test_package(context).await;
     let (sender, gas) = get_sender_and_one_gas(context).await;
 
-    let deposit_tx = make_send_to_account_tx(10_000_000, sender, sender, gas, rgp);
+    let deposit_tx = TestTransactionBuilder::new(sender, gas, rgp)
+        .transfer_sui_to_address_balance(10_000_000, sender)
+        .build();
     test_cluster.sign_and_execute_transaction(&deposit_tx).await;
 
     test_cluster.fullnode_handle.sui_node.with(|node| {
@@ -814,7 +805,9 @@ async fn test_sponsored_address_balance_storage_rebates() {
         .unwrap()
         .1
         .object_ref();
-    let deposit_tx_sender = make_send_to_account_tx(100_000_000, sender, sender, sender_gas, rgp);
+    let deposit_tx_sender = TestTransactionBuilder::new(sender, sender_gas, rgp)
+        .transfer_sui_to_address_balance(100_000_000, sender)
+        .build();
     test_cluster
         .sign_and_execute_transaction(&deposit_tx_sender)
         .await;
@@ -828,8 +821,9 @@ async fn test_sponsored_address_balance_storage_rebates() {
         .unwrap()
         .1
         .object_ref();
-    let deposit_tx_sponsor =
-        make_send_to_account_tx(100_000_000, sponsor, sponsor, sponsor_gas, rgp);
+    let deposit_tx_sponsor = TestTransactionBuilder::new(sponsor, sponsor_gas, rgp)
+        .transfer_sui_to_address_balance(100_000_000, sponsor)
+        .build();
     test_cluster
         .sign_and_execute_transaction(&deposit_tx_sponsor)
         .await;
@@ -1562,7 +1556,9 @@ async fn test_address_balance_gas_cost_parity() {
 
     let (sender, gas_for_deposit) = get_sender_and_one_gas(&mut test_cluster.wallet).await;
 
-    let deposit_tx = make_send_to_account_tx(100_000_000, sender, sender, gas_for_deposit, rgp);
+    let deposit_tx = TestTransactionBuilder::new(sender, gas_for_deposit, rgp)
+        .transfer_sui_to_address_balance(100_000_000, sender)
+        .build();
     test_cluster.sign_and_execute_transaction(&deposit_tx).await;
 
     let gas_coin = test_cluster
@@ -1722,7 +1718,9 @@ async fn test_address_balance_gas_charged_on_move_abort() {
 
     let (sender, gas_for_deposit) = get_sender_and_one_gas(&mut test_cluster.wallet).await;
 
-    let deposit_tx = make_send_to_account_tx(10_000_000, sender, sender, gas_for_deposit, rgp);
+    let deposit_tx = TestTransactionBuilder::new(sender, gas_for_deposit, rgp)
+        .transfer_sui_to_address_balance(10_000_000, sender)
+        .build();
     test_cluster.sign_and_execute_transaction(&deposit_tx).await;
 
     test_cluster.fullnode_handle.sui_node.with(|node| {
@@ -1865,7 +1863,9 @@ async fn test_sponsor_insufficient_balance_charges_zero_gas() {
         .unwrap()
         .1
         .object_ref();
-    let deposit_tx_sender = make_send_to_account_tx(100_000_000, sender, sender, sender_gas, rgp);
+    let deposit_tx_sender = TestTransactionBuilder::new(sender, sender_gas, rgp)
+        .transfer_sui_to_address_balance(100_000_000, sender)
+        .build();
     test_cluster
         .sign_and_execute_transaction(&deposit_tx_sender)
         .await;
@@ -1880,8 +1880,9 @@ async fn test_sponsor_insufficient_balance_charges_zero_gas() {
         .unwrap()
         .1
         .object_ref();
-    let deposit_tx_sponsor =
-        make_send_to_account_tx(sponsor_initial_balance, sponsor, sponsor, sponsor_gas, rgp);
+    let deposit_tx_sponsor = TestTransactionBuilder::new(sponsor, sponsor_gas, rgp)
+        .transfer_sui_to_address_balance(sponsor_initial_balance, sponsor)
+        .build();
     test_cluster
         .sign_and_execute_transaction(&deposit_tx_sponsor)
         .await;
@@ -2042,7 +2043,9 @@ async fn test_insufficient_balance_charges_zero_gas() {
     let initial_balance = 30_000_000u64;
     let withdraw_amount = 15_000_000u64;
 
-    let deposit_tx = make_send_to_account_tx(initial_balance, sender, sender, gas_for_deposit, rgp);
+    let deposit_tx = TestTransactionBuilder::new(sender, gas_for_deposit, rgp)
+        .transfer_sui_to_address_balance(initial_balance, sender)
+        .build();
     test_cluster.sign_and_execute_transaction(&deposit_tx).await;
 
     test_cluster.fullnode_handle.sui_node.with(|node| {
@@ -2160,7 +2163,9 @@ async fn test_soft_bundle_different_gas_payers() {
         .unwrap()
         .1
         .object_ref();
-    let deposit_tx1 = make_send_to_account_tx(10_000_000, sender1, sender1, sender1_gas, rgp);
+    let deposit_tx1 = TestTransactionBuilder::new(sender1, sender1_gas, rgp)
+        .transfer_sui_to_address_balance(10_000_000, sender1)
+        .build();
     test_cluster
         .sign_and_execute_transaction(&deposit_tx1)
         .await;
@@ -2174,7 +2179,9 @@ async fn test_soft_bundle_different_gas_payers() {
         .unwrap()
         .1
         .object_ref();
-    let deposit_tx2 = make_send_to_account_tx(10_000_000, sender2, sender2, sender2_gas, rgp);
+    let deposit_tx2 = TestTransactionBuilder::new(sender2, sender2_gas, rgp)
+        .transfer_sui_to_address_balance(10_000_000, sender2)
+        .build();
     test_cluster
         .sign_and_execute_transaction(&deposit_tx2)
         .await;
